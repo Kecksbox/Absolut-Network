@@ -2,7 +2,7 @@ import logging
 from typing import Tuple
 import tensorflow as tf
 
-from main import Madam, leaky_abs_relu
+from main import Madam, leaky_abs_relu, leaky_abs_relu_up_only
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -26,7 +26,7 @@ def main():
     a_bound = (0, 1)
     b_bound = a_bound
 
-    optimizer = Madam()
+    optimizer = Madam(bind_lr=False)
 
     criterion = tf.keras.losses.MeanSquaredError()
 

@@ -3,16 +3,20 @@ import datetime
 import logging
 import math
 import os
-from typing import List
+import random
+from abc import abstractmethod
+from typing import List, Callable
 
 import tensorflow as tf
-import tensorflow_addons as tfa
 import numpy as np
 
 import utils
 from utils import COSINEANNEALINGLR
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+work_dir = "."
+# work_dir = os.environ["WORK"]
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -36,14 +40,28 @@ parser.add_argument('--cutout', action='store_true', default=False, help='use cu
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
 parser.add_argument('--save', type=str, default='EXP', help='experiment name')
-parser.add_argument('--seed', type=int, default=2, help='random seed')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 parser.add_argument('--val_portion', type=float, default=0.0, help='portion of training data')
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--mixed_op_type', type=str, default='binary', help='the type of mixed operation used in the cells')
-parser.add_argument('--mixed_op_temperature', type=float, default=0.5,
-                    help='temperature applied to the gumble softmax sampels (binary versions only).')
+
+parser.add_argument('--log_name', type=str, default="")
+parser.add_argument('--set_absolute', type=bool, default=False)
+parser.add_argument('--set_absolute_v2', type=bool, default=False)
+parser.add_argument('--optimizer', type=str, default='adam')
+parser.add_argument('--actfunction', type=str, default='leaky_abs_relu')
+parser.add_argument('--use_activation_shift', type=bool, default=False)
+parser.add_argument('--clip_variables', type=bool, default=False)
+
+parser.add_argument('--use_data_augmentation', type=bool, default=False)
+
+parser.add_argument('--check_positive_constraint', type=bool, default=False)
+parser.add_argument('--check_weight_explosion', type=bool, default=False)
+
+
 args = parser.parse_args()
+
+max_weight = 0.0
 
 
 class Madam(tf.keras.optimizers.Optimizer):
@@ -66,7 +84,7 @@ class Madam(tf.keras.optimizers.Optimizer):
         self.initial_lr = learning_rate
 
     def apply_gradients(
-        self, grads_and_vars, name=None, experimental_aggregate_gradients=True
+            self, grads_and_vars, name=None, experimental_aggregate_gradients=True
     ):
 
         lr_t = self._decayed_lr(tf.float32)
@@ -96,7 +114,7 @@ class Madam(tf.keras.optimizers.Optimizer):
                 abs_var = tf.abs(var)
                 dot = tf.reduce_sum(tf.reshape(abs_grad, shape=(-1,)) * tf.reshape(abs_var, shape=(-1,)))
                 cos_angle = dot / (tf.norm(abs_grad) * tf.norm(abs_var))
-                max_lr = tf.math.pow(1 + cos_angle, 1/L) - 1
+                max_lr = tf.math.pow(1 + cos_angle, 1 / L) - 1
                 if lr_t >= max_lr:
                     lr_t = trust * max_lr
 
@@ -138,10 +156,12 @@ class Madam(tf.keras.optimizers.Optimizer):
         # We are updating weight here. We don't need to return anything
         var.assign(new_var)
 
+
 def contains_negative(x):
     return tf.reduce_any(tf.math.less(
         x, 0
     ))
+
 
 def sin_mapping(x):
     return (tf.math.sin(x * math.pi) + 1) / 2
@@ -151,17 +171,81 @@ def identity(x):
     return tf.identity(x)
 
 
+class ActivationFactory:
+    @abstractmethod
+    def __call__(self, x: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        pass
+
+
 def leaky_abs_relu(x):
     return tf.abs(tf.nn.leaky_relu(
         x, alpha=0.2
     ))
 
 
-act_func = leaky_abs_relu
+class LeakyAbsRelu(ActivationFactory):
+    def __call__(self, x, *args, **kwargs) -> tf.Tensor:
+        return leaky_abs_relu(x)
+
+
+class ExhibitoryInhibitory(ActivationFactory):
+    def __init__(self):
+        self.ex_mask = None
+
+    def __call__(self, x, *args, **kwargs) -> tf.Tensor:
+        if self.ex_mask is None:
+            self.ex_mask = tf.greater(tf.random.uniform(x.shape), 0.5)
+
+        a = leaky_abs_relu_up_only(x)
+        b = leaky_abs_relu_down_only(x)
+        c = tf.cast(self.ex_mask, dtype=tf.float32) * a + (1 - tf.cast(self.ex_mask, dtype=tf.float32)) * b
+
+        return c
+
+
+# dont use this with variable activation shift!
+def leaky_abs_relu_up_only(x):
+    alpha = 0.2
+    x_shift = 0.5
+    x = tf.nn.leaky_relu(
+        x, alpha=alpha
+    )
+    min = x_shift * alpha
+    x += min
+    return x
+
+
+# dont use this with variable activation shift!
+def leaky_abs_relu_down_only(x):
+    a = 0.5 - x
+    b = 0.0
+    return tf.math.maximum(a, b)
+
+
+act_func_dict = {
+    "leaky_abs_relu": LeakyAbsRelu,
+    "ex_and_in": ExhibitoryInhibitory,
+}
+
+act_func = act_func_dict[args.actfunction]
+
+optimizer_dict = {
+    "adam": tf.keras.optimizers.Adam(
+        learning_rate=0.001,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-07,
+        amsgrad=False,
+    ),
+    "madam": Madam(bind_lr=False, learning_rate=0.001),
+    "madam_trust": Madam(bind_lr=True, learning_rate=0.8),
+}
+
+optimizer = optimizer_dict[args.optimizer]
 
 
 class Network(tf.keras.Model):
-    def __init__(self, cnn_layers, dense_layers, dim_h, dim_out, weight_scale=1.0, dropout=0.01):
+    def __init__(self, cnn_layers, dense_layers, dim_h, dim_out, init_filters=32, weight_scale=1.0, dropout=0.0):
         super(Network, self).__init__()
         self.weight_scale = weight_scale
 
@@ -169,73 +253,99 @@ class Network(tf.keras.Model):
         self._bias = []
         self._rescale = []
         self._dropouts = []
-        for _ in range(cnn_layers):
+
+        if args.use_data_augmentation:
             self._layers.append(
-                tf.keras.layers.Dropout(
-                    rate=dropout,
-                )
+                data_augmentation
             )
             self._layers[-1]._act_func = None
+
+        filters = init_filters
+        for cnn_index in range(cnn_layers):
             self._layers.append(
                 tf.keras.layers.Conv2D(
-                    64, kernel_size=(3, 3), activation=None,
-                    kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
-                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
+                    filters, kernel_size=(3, 3), activation=None, padding='same',
+                    kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                           maxval=1. * weight_scale),
+                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                         maxval=1. * weight_scale),
                 )
             )
-            self._layers[-1]._act_func = act_func
+            self._layers[-1]._act_func = act_func()
+
+            self._layers.append(
+                tf.keras.layers.Conv2D(
+                    filters, kernel_size=(3, 3), activation=None, padding='same',
+                    kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                           maxval=1. * weight_scale),
+                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                         maxval=1. * weight_scale),
+                )
+            )
+            self._layers[-1]._act_func = act_func()
+
             self._layers.append(
                 tf.keras.layers.MaxPooling2D(pool_size=(2, 2))
             )
             self._layers[-1]._act_func = None
+
+            filters *= 2
 
         self._layers.append(
             tf.keras.layers.Flatten()
         )
         self._layers[-1]._act_func = None
 
-        self._layers.append(
-            tf.keras.layers.Dropout(
-                rate=dropout,
-            )
-        )
-        self._layers[-1]._act_func = None
-
         for _ in range(dense_layers):
+            self._layers.append(
+                tf.keras.layers.Dropout(
+                    rate=dropout,
+                )
+            )
+            self._layers[-1]._act_func = None
+
             self._layers.append(
                 tf.keras.layers.Dense(
                     units=dim_h, activation=None,
-                    kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
-                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
+                    kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                           maxval=1. * weight_scale),
+                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                         maxval=1. * weight_scale),
                 )
             )
-            self._layers[-1]._act_func = act_func
+            self._layers[-1]._act_func = act_func()
 
         self._layers.append(
             tf.keras.layers.Dense(
                 units=dim_out, activation=None,
-                kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
-                bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale, maxval=1. * weight_scale),
+                kernel_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                       maxval=1. * weight_scale),
+                bias_initializer=tf.keras.initializers.RandomUniform(minval=0.01 * weight_scale,
+                                                                     maxval=1. * weight_scale),
             )
         )
-        self._layers[-1]._act_func = act_func
+        self._layers[-1]._act_func = act_func()
 
         self._rescale = [None] * len(self._layers)
         self._activation_shift = [None] * len(self._layers)
 
-    #@tf.function
-    def __call__(self, x, training=False, *args, **kwargs):
+    # @tf.function
+    def __call__(self, x, training=False):
         # Adding any of these makes you unable to run in graph mode!!!
-        set_absolute = False
+        set_absolute = args.set_absolute
         use_rescaling = False
-        use_activation_shift = True
+        use_activation_shift = args.use_activation_shift
 
-        check_positive_constraint = False
+        check_positive_constraint = args.check_positive_constraint
 
         if check_positive_constraint and contains_negative(x):
             raise RuntimeError("Contains negative numbers.")
 
         for index, layer in enumerate(self._layers):
+
+            if args.use_data_augmentation and index == 0 and training is False:
+                continue
+
             tmp_weights = []
             if set_absolute and len(layer._trainable_weights) > 0:
                 assert len(layer._trainable_weights) == 2
@@ -254,7 +364,8 @@ class Network(tf.keras.Model):
                     if self._activation_shift[index] is None:
                         layer_name = layer.name
                         self._activation_shift[index] = tf.Variable(
-                            tf.random.uniform(shape=x.shape, minval=0.01 * self.weight_scale, maxval=1.0 * self.weight_scale),
+                            tf.random.uniform(shape=x.shape, minval=0.3,
+                                              maxval=0.7),
                             name=layer_name + '/activation_shift'
                         )
 
@@ -297,12 +408,9 @@ data_augmentation = tf.keras.Sequential([
 
 
 def main():
-    np.random.seed(args.seed)
-    tf.random.set_seed(args.seed)
-
     # Prepare tensorboard logs
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = args.log_path + '/' + current_time + '_train_search'
+    log_dir = work_dir + '/' + args.log_path + '/' + current_time + args.log_name
     tb_summary_writer = tf.summary.create_file_writer(log_dir)
 
     criterion = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
@@ -359,26 +467,11 @@ def main():
     test_dataset = test_dataset.batch(args.batch_size, drop_remainder=True)
     test_dataset = test_dataset.cache().prefetch(tf.data.AUTOTUNE)
 
-    model = Network(cnn_layers=3, dense_layers=3, dim_h=2000, dim_out=10, weight_scale=0.1)
+    model = Network(cnn_layers=3, dense_layers=2, dim_h=2000, dim_out=10, weight_scale=0.01, dropout=0.0)
 
     scheduler = COSINEANNEALINGLR(
         initial_learning_rate=args.learning_rate, decay_steps=float(args.epochs), min_lr=args.learning_rate_min
     )
-    # optimizer = tf.optimizers.SGDW(
-    #    learning_rate=scheduler.get_lr(),
-    #    momentum=args.momentum,
-    #    weight_decay=args.weight_decay
-    # )
-
-    #optimizer = tf.keras.optimizers.Adam(
-    #    learning_rate=0.001,
-    #    beta_1=0.9,
-    #    beta_2=0.999,
-    #    epsilon=1e-07,
-    #    amsgrad=False,
-    #)
-
-    optimizer = Madam(bind_lr=True, learning_rate=0.5)
 
     patience = 40
 
@@ -419,11 +512,14 @@ def main():
         logging.info('(best train_obj %f)', best_obj)
         logging.info('(best test_acc %f)', best_test_acc)
 
-        # with tb_summary_writer.as_default():
-        # tf.summary.scalar('train_obj', train_obj, step=epoch)
-        # tf.summary.scalar('train_acc', train_acc, step=epoch)
-        # tf.summary.scalar('valid_obj', valid_obj, step=epoch)
-        # tf.summary.scalar('valid_acc', valid_acc, step=epoch)
+        if args.check_weight_explosion:
+            logging.info('(max_weight %f)', max_weight)
+
+        with tb_summary_writer.as_default():
+            tf.summary.scalar('train_obj', train_obj, step=epoch)
+            tf.summary.scalar('train_acc', train_acc, step=epoch)
+            tf.summary.scalar('test_obj', test_obj, step=epoch)
+            tf.summary.scalar('test_acc', test_acc, step=epoch)
 
         # utils.save(model, os.path.join(args.save, 'weights.pt'))
 
@@ -446,6 +542,24 @@ def train(train_dataset, model, criterion, optimizer, lr):
         grads = tape.gradient(loss, model.trainable_variables)
         grads, _ = tf.clip_by_global_norm(grads, args.grad_clip)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        if args.clip_variables:
+            for var in model.trainable_variables:
+                var.assign(
+                    tf.maximum(0.0, var)
+                )
+
+        if args.set_absolute_v2:
+            for var in model.trainable_variables:
+                var.assign(
+                    tf.math.abs(var)
+                )
+
+        if args.check_weight_explosion:
+            global max_weight
+            max_weight = 0.0
+            for var in model.trainable_variables:
+                max_weight = tf.maximum(max_weight, tf.reduce_max(tf.abs(var)))
 
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
         objs.update(loss.numpy(), n)
